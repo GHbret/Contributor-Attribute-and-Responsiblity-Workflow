@@ -52,7 +52,7 @@ membership and inherited responsibilities correctly.
 
 ## Requirements
 
-- Collibra with the Flowable-based workflow engine (targets `http://instance.collibra.com/apiv2`)
+- Collibra with the Flowable-based workflow engine (targets `http://www.collibra.com/apiv2`)
 - A resource role to grant the capability to (any role works — you choose it at deploy time)
 - A global role carrying **Start workflow** and **Participate in workflow**
 - Permission to import workflow definitions
@@ -142,7 +142,7 @@ written up in `DEPLOYMENT.md`, but the headline one:
 
 **Collibra decides a workflow's API version from the root element's
 `targetNamespace`.** A file declaring anything other than
-`http://instance.collibra.com/apiv2` is flagged as using the deprecated API v1 no
+`http://www.collibra.com/apiv2` is flagged as using the deprecated API v1 no
 matter what its scripts actually call. That banner is immune to every
 script-level change, survives restarts, and never appears on workflows built in
 Collibra's own Designer.
