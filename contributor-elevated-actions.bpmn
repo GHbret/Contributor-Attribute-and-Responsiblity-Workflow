@@ -1,0 +1,712 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:flowable="http://flowable.org/bpmn" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:omgdc="http://www.omg.org/spec/DD/20100524/DC" xmlns:omgdi="http://www.omg.org/spec/DD/20100524/DI" xmlns:design="http://flowable.org/design" typeLanguage="http://www.w3.org/2001/XMLSchema" expressionLanguage="http://www.w3.org/1999/XPath" targetNamespace="http://www.collibra.com/apiv2" design:palette="flowable-process-palette">
+  <process id="contributorElevatedActions" name="Manage Attributes and Responsibilities (Contributor-Enabled)" isExecutable="true">
+    <documentation>Lets a Contributor-licensed user add, change or clear asset attributes and assign or unassign responsibilities on the asset it is started from. Workflow execution is not restricted by the initiator&#x27;s license, so these actions succeed here even though the same actions are blocked for that user in the standard UI. Which role may use it is set in the definition&#x27;s Start Workflow role setting, NOT in this file. The form task goes to whoever started the workflow. Users supply attribute types, roles and people BY NAME; the scripts resolve them and look up existing values themselves, so no one needs an internal UUID. Every run leaves a comment on the asset recording what happened, success or failure.</documentation>
+    <extensionElements>
+      <design:stencilid><![CDATA[BPMNDiagram]]></design:stencilid>
+      <design:language><![CDATA[English]]></design:language>
+    </extensionElements>
+    <startEvent id="startnoneevent1" name="Start event" flowable:initiator="initiator" flowable:formFieldValidation="false">
+      <extensionElements>
+        <flowable:work-form-field-validation><![CDATA[false]]></flowable:work-form-field-validation>
+        <design:stencilid><![CDATA[StartNoneEvent]]></design:stencilid>
+      </extensionElements>
+    </startEvent>
+    <userTask id="usertask_provideDetails" name="Describe the change" flowable:candidateUsers="user(${initiator})" flowable:formFieldValidation="false">
+      <documentation>Describe the change you want made to this asset. Use names, not IDs - the workflow looks everything else up.</documentation>
+      <extensionElements>
+        <flowable:formProperty id="action" name="What do you want to do?" type="enum" variable="action" required="true">
+          <flowable:value id="SetAttribute" name="Set an attribute value (creates it if empty)"></flowable:value>
+          <flowable:value id="AddAttribute" name="Add another value to an attribute"></flowable:value>
+          <flowable:value id="ClearAttribute" name="Clear an attribute value"></flowable:value>
+          <flowable:value id="AssignRole" name="Give someone a role on this asset"></flowable:value>
+          <flowable:value id="RemoveRole" name="Take a role away from someone"></flowable:value>
+        </flowable:formProperty>
+        <flowable:formProperty id="attributeType" name="Attribute name - for the attribute actions (e.g. Note, Description)" type="string" variable="attributeType"></flowable:formProperty>
+        <flowable:formProperty id="attributeValue" name="Value - leave blank only when clearing" type="textarea" variable="attributeValue"></flowable:formProperty>
+        <flowable:formProperty id="roleName" name="Role name - for the role actions (e.g. Steward, Owner)" type="string" variable="roleName"></flowable:formProperty>
+        <flowable:formProperty id="assignee" name="Person - username of the user receiving or losing the role" type="string" variable="assignee"></flowable:formProperty>
+        <flowable:formProperty id="justification" name="Reason for this change (optional)" type="textarea" variable="justification"></flowable:formProperty>
+        <flowable:formProperty id="submit" name="Submit" type="button" variable="submit"></flowable:formProperty>
+        <flowable:task-candidates-type><![CDATA[all]]></flowable:task-candidates-type>
+        <design:stencilid><![CDATA[FormTask]]></design:stencilid>
+      </extensionElements>
+    </userTask>
+    <exclusiveGateway id="gateway_action" name="Which action?">
+      <extensionElements>
+        <design:stencilid><![CDATA[ExclusiveGateway]]></design:stencilid>
+      </extensionElements>
+    </exclusiveGateway>
+    <scriptTask id="scripttask_setAttribute" name="Set attribute value" scriptFormat="groovy" flowable:autoStoreVariables="false">
+      <extensionElements>
+        <design:stencilid><![CDATA[ScriptTask]]></design:stencilid>
+      </extensionElements>
+      <script><![CDATA[
+//#importFile NONE
+import com.collibra.dgc.core.api.dto.instance.attribute.AddAttributeRequest
+import com.collibra.dgc.core.api.dto.instance.attribute.ChangeAttributeRequest
+import com.collibra.dgc.core.api.dto.instance.attribute.FindAttributesRequest
+
+// Set an attribute value: change it if one exists, create it if not.
+boolean actionSucceeded = false
+String errorMessage = null
+
+loggerApi.info("Set attribute value requested by " + execution.getVariable("initiator"))
+
+try {
+    // Accept either a display name ("Note") or a UUID.
+    String typeInput = (execution.getVariable("attributeType") as String)?.trim()
+    if (typeInput == null || typeInput.isEmpty()) {
+        throw new IllegalArgumentException("Attribute type is required, e.g. 'Note'.")
+    }
+    UUID attributeTypeId
+    if (typeInput ==~ /(?i)[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}/) {
+        attributeTypeId = string2Uuid(typeInput)
+    } else {
+        // NOTE: getAttributeTypeByName is the documented v2 replacement for
+        // AttributeTypeComponent.getAttributeTypeBySignifier.
+        attributeTypeId = attributeTypeApi.getAttributeTypeByName(typeInput).getId()
+    }
+
+    // Look the existing value(s) up ourselves -- the user never supplies an id.
+    // NOTE: the builder takes typeIds(List), not typeId(UUID) -- confirmed from
+    // the engine's own "Possible solutions: typeIds(java.util.List),
+    // assetId(java.util.UUID)" error.
+    def existing = attributeApi.findAttributes(
+        FindAttributesRequest.builder()
+            .assetId(item.id)
+            .typeIds([attributeTypeId])
+            .build()).getResults()
+
+    String value = execution.getVariable("attributeValue") as String
+    if (value == null) { value = "" }
+
+    if (existing == null || existing.isEmpty()) {
+        attributeApi.addAttribute(
+            AddAttributeRequest.builder()
+                .assetId(item.id).typeId(attributeTypeId).value(value).build())
+        execution.setVariable("resultDetail", "Created " + typeInput + ".")
+    } else {
+        attributeApi.changeAttribute(
+            ChangeAttributeRequest.builder()
+                .id(existing[0].getId()).value(value).build())
+        execution.setVariable("resultDetail", "Updated " + typeInput + ".")
+    }
+    actionSucceeded = true
+} catch (Exception e) {
+    errorMessage = "Set attribute value failed: " + e.getMessage()
+    loggerApi.info("Set attribute value failed: " + e.getMessage())
+}
+
+execution.setVariable("actionSucceeded", actionSucceeded)
+execution.setVariable("errorMessage", errorMessage)
+]]></script>
+    </scriptTask>
+    <scriptTask id="scripttask_addAttribute" name="Add another value" scriptFormat="groovy" flowable:autoStoreVariables="false">
+      <extensionElements>
+        <design:stencilid><![CDATA[ScriptTask]]></design:stencilid>
+      </extensionElements>
+      <script><![CDATA[
+//#importFile NONE
+import com.collibra.dgc.core.api.dto.instance.attribute.AddAttributeRequest
+
+// Append an additional value to a multi-valued attribute type.
+boolean actionSucceeded = false
+String errorMessage = null
+
+loggerApi.info("Add another attribute value requested by " + execution.getVariable("initiator"))
+
+try {
+    // Accept either a display name ("Note") or a UUID.
+    String typeInput = (execution.getVariable("attributeType") as String)?.trim()
+    if (typeInput == null || typeInput.isEmpty()) {
+        throw new IllegalArgumentException("Attribute type is required, e.g. 'Note'.")
+    }
+    UUID attributeTypeId
+    if (typeInput ==~ /(?i)[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}/) {
+        attributeTypeId = string2Uuid(typeInput)
+    } else {
+        // NOTE: getAttributeTypeByName is the documented v2 replacement for
+        // AttributeTypeComponent.getAttributeTypeBySignifier.
+        attributeTypeId = attributeTypeApi.getAttributeTypeByName(typeInput).getId()
+    }
+
+    String value = execution.getVariable("attributeValue") as String
+    if (value == null || value.trim().isEmpty()) {
+        throw new IllegalArgumentException("A value is required.")
+    }
+
+    attributeApi.addAttribute(
+        AddAttributeRequest.builder()
+            .assetId(item.id).typeId(attributeTypeId).value(value).build())
+    execution.setVariable("resultDetail", "Added another " + typeInput + " value.")
+    actionSucceeded = true
+} catch (Exception e) {
+    errorMessage = "Add another attribute value failed: " + e.getMessage()
+    loggerApi.info("Add another attribute value failed: " + e.getMessage())
+}
+
+execution.setVariable("actionSucceeded", actionSucceeded)
+execution.setVariable("errorMessage", errorMessage)
+]]></script>
+    </scriptTask>
+    <scriptTask id="scripttask_clearAttribute" name="Clear attribute value" scriptFormat="groovy" flowable:autoStoreVariables="false">
+      <extensionElements>
+        <design:stencilid><![CDATA[ScriptTask]]></design:stencilid>
+      </extensionElements>
+      <script><![CDATA[
+//#importFile NONE
+import com.collibra.dgc.core.api.dto.instance.attribute.FindAttributesRequest
+
+// Remove the existing value(s) of an attribute type from this asset.
+boolean actionSucceeded = false
+String errorMessage = null
+
+loggerApi.info("Clear attribute value requested by " + execution.getVariable("initiator"))
+
+try {
+    // Accept either a display name ("Note") or a UUID.
+    String typeInput = (execution.getVariable("attributeType") as String)?.trim()
+    if (typeInput == null || typeInput.isEmpty()) {
+        throw new IllegalArgumentException("Attribute type is required, e.g. 'Note'.")
+    }
+    UUID attributeTypeId
+    if (typeInput ==~ /(?i)[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}/) {
+        attributeTypeId = string2Uuid(typeInput)
+    } else {
+        // NOTE: getAttributeTypeByName is the documented v2 replacement for
+        // AttributeTypeComponent.getAttributeTypeBySignifier.
+        attributeTypeId = attributeTypeApi.getAttributeTypeByName(typeInput).getId()
+    }
+
+    // Look the existing value(s) up ourselves -- the user never supplies an id.
+    // NOTE: the builder takes typeIds(List), not typeId(UUID) -- confirmed from
+    // the engine's own "Possible solutions: typeIds(java.util.List),
+    // assetId(java.util.UUID)" error.
+    def existing = attributeApi.findAttributes(
+        FindAttributesRequest.builder()
+            .assetId(item.id)
+            .typeIds([attributeTypeId])
+            .build()).getResults()
+
+    if (existing == null || existing.isEmpty()) {
+        throw new IllegalArgumentException(
+            "There is no '" + typeInput + "' value on this asset to clear.")
+    }
+    int removed = 0
+    for (def a : existing) {
+        attributeApi.removeAttribute(a.getId())
+        removed = removed + 1
+    }
+    execution.setVariable("resultDetail",
+        "Cleared " + removed + " " + typeInput + " value(s).")
+    actionSucceeded = true
+} catch (Exception e) {
+    errorMessage = "Clear attribute value failed: " + e.getMessage()
+    loggerApi.info("Clear attribute value failed: " + e.getMessage())
+}
+
+execution.setVariable("actionSucceeded", actionSucceeded)
+execution.setVariable("errorMessage", errorMessage)
+]]></script>
+    </scriptTask>
+    <scriptTask id="scripttask_assignRole" name="Assign role" scriptFormat="groovy" flowable:autoStoreVariables="false">
+      <extensionElements>
+        <design:stencilid><![CDATA[ScriptTask]]></design:stencilid>
+      </extensionElements>
+      <script><![CDATA[
+//#importFile NONE
+import com.collibra.dgc.core.api.dto.instance.responsibility.AddResponsibilityRequest
+import com.collibra.dgc.core.api.dto.role.FindRolesRequest
+import com.collibra.dgc.core.api.dto.user.FindUsersRequest
+import com.collibra.dgc.core.api.model.ResourceType
+
+// Give a person a role (responsibility) on this asset.
+boolean actionSucceeded = false
+String errorMessage = null
+
+loggerApi.info("Assign role requested by " + execution.getVariable("initiator"))
+
+try {
+    String roleInput = (execution.getVariable("roleName") as String)?.trim()
+    if (roleInput == null || roleInput.isEmpty()) {
+        throw new IllegalArgumentException("Role is required, e.g. 'Steward'.")
+    }
+    UUID roleId = null
+    if (roleInput ==~ /(?i)[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}/) {
+        roleId = string2Uuid(roleInput)
+    } else {
+        // RoleApi has no getRoleByName. Rather than guess at the filter fields
+        // on FindRolesRequest, list the roles and match here: role counts are
+        // small, and this makes the match case-insensitive for free.
+        def roles = roleApi.findRoles(FindRolesRequest.builder().build()).getResults()
+        for (def r : roles) {
+            if (roleInput.equalsIgnoreCase(r.getName())) { roleId = r.getId(); break }
+        }
+        if (roleId == null) {
+            throw new IllegalArgumentException("No role is named '" + roleInput
+                + "'. Check the spelling, or paste the role's UUID instead.")
+        }
+    }
+
+    String userInput = (execution.getVariable("assignee") as String)?.trim()
+    if (userInput == null || userInput.isEmpty()) {
+        throw new IllegalArgumentException(
+            "Person is required -- a username such as 'eliza', or their UUID.")
+    }
+    UUID ownerId = null
+    if (userInput ==~ /(?i)[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}/) {
+        ownerId = string2Uuid(userInput)
+    } else {
+        def candidates = null
+        try {
+            candidates = userApi.findUsers(
+                FindUsersRequest.builder().name(userInput).build()).getResults()
+        } catch (Exception lookupFailure) {
+            throw new IllegalArgumentException("Could not look up '" + userInput
+                + "' by name (" + lookupFailure.getMessage()
+                + "). Paste the person's UUID into the Person field instead.")
+        }
+        if (candidates != null) {
+            for (def u : candidates) {
+                if (userInput.equalsIgnoreCase(u.getUserName())) { ownerId = u.getId(); break }
+            }
+            // A single unambiguous hit is good enough even if the username
+            // itself did not match (e.g. the full name was entered).
+            if (ownerId == null && candidates.size() == 1) {
+                ownerId = candidates[0].getId()
+            }
+        }
+        if (ownerId == null) {
+            throw new IllegalArgumentException("No single user matches '" + userInput
+                + "'. Try their username (e.g. 'eliza') or paste their UUID.")
+        }
+    }
+
+    // resourceType is required as well as resourceId -- the engine rejects the
+    // request with "addResourceMemberIncompleteParameters [resourceType = null]"
+    // without it. This workflow always runs against an asset.
+    responsibilityApi.addResponsibility(
+        AddResponsibilityRequest.builder()
+            .resourceId(item.id)
+            .resourceType(ResourceType.Asset)
+            .roleId(roleId)
+            .ownerId(ownerId)
+            .build())
+    execution.setVariable("resultDetail",
+        "Assigned " + roleInput + " to " + userInput + ".")
+    actionSucceeded = true
+} catch (Exception e) {
+    errorMessage = "Assign role failed: " + e.getMessage()
+    loggerApi.info("Assign role failed: " + e.getMessage())
+}
+
+execution.setVariable("actionSucceeded", actionSucceeded)
+execution.setVariable("errorMessage", errorMessage)
+]]></script>
+    </scriptTask>
+    <scriptTask id="scripttask_removeRole" name="Remove role" scriptFormat="groovy" flowable:autoStoreVariables="false">
+      <extensionElements>
+        <design:stencilid><![CDATA[ScriptTask]]></design:stencilid>
+      </extensionElements>
+      <script><![CDATA[
+//#importFile NONE
+import com.collibra.dgc.core.api.dto.instance.responsibility.FindResponsibilitiesRequest
+import com.collibra.dgc.core.api.dto.role.FindRolesRequest
+import com.collibra.dgc.core.api.dto.user.FindUsersRequest
+import com.collibra.dgc.core.api.model.ResourceType
+
+// Take a role (responsibility) away from a person on this asset.
+boolean actionSucceeded = false
+String errorMessage = null
+
+loggerApi.info("Remove role requested by " + execution.getVariable("initiator"))
+
+try {
+    String roleInput = (execution.getVariable("roleName") as String)?.trim()
+    if (roleInput == null || roleInput.isEmpty()) {
+        throw new IllegalArgumentException("Role is required, e.g. 'Steward'.")
+    }
+    UUID roleId = null
+    if (roleInput ==~ /(?i)[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}/) {
+        roleId = string2Uuid(roleInput)
+    } else {
+        // RoleApi has no getRoleByName. Rather than guess at the filter fields
+        // on FindRolesRequest, list the roles and match here: role counts are
+        // small, and this makes the match case-insensitive for free.
+        def roles = roleApi.findRoles(FindRolesRequest.builder().build()).getResults()
+        for (def r : roles) {
+            if (roleInput.equalsIgnoreCase(r.getName())) { roleId = r.getId(); break }
+        }
+        if (roleId == null) {
+            throw new IllegalArgumentException("No role is named '" + roleInput
+                + "'. Check the spelling, or paste the role's UUID instead.")
+        }
+    }
+
+    String userInput = (execution.getVariable("assignee") as String)?.trim()
+    if (userInput == null || userInput.isEmpty()) {
+        throw new IllegalArgumentException(
+            "Person is required -- a username such as 'eliza', or their UUID.")
+    }
+    UUID ownerId = null
+    if (userInput ==~ /(?i)[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}/) {
+        ownerId = string2Uuid(userInput)
+    } else {
+        def candidates = null
+        try {
+            candidates = userApi.findUsers(
+                FindUsersRequest.builder().name(userInput).build()).getResults()
+        } catch (Exception lookupFailure) {
+            throw new IllegalArgumentException("Could not look up '" + userInput
+                + "' by name (" + lookupFailure.getMessage()
+                + "). Paste the person's UUID into the Person field instead.")
+        }
+        if (candidates != null) {
+            for (def u : candidates) {
+                if (userInput.equalsIgnoreCase(u.getUserName())) { ownerId = u.getId(); break }
+            }
+            // A single unambiguous hit is good enough even if the username
+            // itself did not match (e.g. the full name was entered).
+            if (ownerId == null && candidates.size() == 1) {
+                ownerId = candidates[0].getId()
+            }
+        }
+        if (ownerId == null) {
+            throw new IllegalArgumentException("No single user matches '" + userInput
+                + "'. Try their username (e.g. 'eliza') or paste their UUID.")
+        }
+    }
+
+    // Find the responsibility ourselves rather than asking the user for its id.
+    // FindAttributesRequest turned out to use a plural List filter; whether
+    // FindResponsibilitiesRequest does the same is unverified, so try the
+    // plural form and fall back to the singular rather than burn a deploy
+    // cycle finding out.
+    def finder = FindResponsibilitiesRequest.builder()
+    try {
+        finder = finder.resourceIds([item.id])
+    } catch (Exception ignored) {
+        finder = finder.resourceId(item.id)
+    }
+    // Mirror the resourceType that addResponsibility requires; skip it if this
+    // builder does not expose it, since a query may not need the hint.
+    try {
+        finder = finder.resourceType(ResourceType.Asset)
+    } catch (Exception ignored) { }
+    def found = responsibilityApi.findResponsibilities(finder.build()).getResults()
+
+    // Responsibility exposes getRole()/getOwner(), each a NamedResourceReference
+    // carrying the id -- there is no flat getRoleId()/getOwnerId(). Confirmed
+    // from the engine's own "Possible solutions: getRole(), ... getOwner()".
+    def match = null
+    for (def r : found) {
+        def rRole = r.getRole()
+        def rOwner = r.getOwner()
+        if (rRole == null || rOwner == null) { continue }
+        if (rRole.getId() == roleId && rOwner.getId() == ownerId) { match = r; break }
+    }
+    if (match == null) {
+        throw new IllegalArgumentException(
+            userInput + " does not hold " + roleInput + " directly on this asset. "
+            + "Inherited roles must be removed where they were granted.")
+    }
+    responsibilityApi.removeResponsibility(match.getId())
+    execution.setVariable("resultDetail",
+        "Removed " + roleInput + " from " + userInput + ".")
+    actionSucceeded = true
+} catch (Exception e) {
+    errorMessage = "Remove role failed: " + e.getMessage()
+    loggerApi.info("Remove role failed: " + e.getMessage())
+}
+
+execution.setVariable("actionSucceeded", actionSucceeded)
+execution.setVariable("errorMessage", errorMessage)
+]]></script>
+    </scriptTask>
+    <exclusiveGateway id="gateway_result" name="Succeeded?" default="sequenceFlow15">
+      <extensionElements>
+        <design:stencilid><![CDATA[ExclusiveGateway]]></design:stencilid>
+      </extensionElements>
+    </exclusiveGateway>
+    <scriptTask id="scripttask_notifySuccess" name="Record result" scriptFormat="groovy" flowable:autoStoreVariables="false">
+      <extensionElements>
+        <design:stencilid><![CDATA[ScriptTask]]></design:stencilid>
+      </extensionElements>
+      <script><![CDATA[
+//#importFile NONE
+import com.collibra.dgc.core.api.dto.instance.comment.AddCommentRequest
+import com.collibra.dgc.core.api.model.ResourceType
+
+// Record the result and leave an audit comment on the asset.
+String detail = execution.getVariable("resultDetail") as String
+String msg = (detail == null || detail.isEmpty()) ? "Change completed." : detail
+execution.setVariable("resultMessage", msg)
+loggerApi.info("Elevated action completed: " + msg)
+
+// This workflow performs actions the initiator's own licence would block,
+// so record every one of them on the asset.
+try {
+    String note = execution.getVariable("justification") as String
+    String body = "<b>Elevated action</b><br/>" + msg
+                  + "<br/>Requested by: " + execution.getVariable("initiator")
+    if (note != null && !note.trim().isEmpty()) {
+        body = body + "<br/>Reason: " + note
+    }
+    commentApi.addComment(
+        AddCommentRequest.builder()
+            .baseResourceType(ResourceType.Asset)
+            .baseResourceId(item.id)
+            .content(body)
+            .build())
+} catch (Exception e) {
+    loggerApi.info("Could not post result comment: " + e.getMessage())
+}
+]]></script>
+    </scriptTask>
+    <endEvent id="endnoneevent_completed" name="Completed">
+      <extensionElements>
+        <design:stencilid><![CDATA[EndNoneEvent]]></design:stencilid>
+      </extensionElements>
+    </endEvent>
+    <scriptTask id="scripttask_handleError" name="Report failure" scriptFormat="groovy" flowable:autoStoreVariables="false">
+      <extensionElements>
+        <design:stencilid><![CDATA[ScriptTask]]></design:stencilid>
+      </extensionElements>
+      <script><![CDATA[
+//#importFile NONE
+import com.collibra.dgc.core.api.dto.instance.comment.AddCommentRequest
+import com.collibra.dgc.core.api.model.ResourceType
+
+// Surface the failure in the UI, not just the log.
+String err = execution.getVariable("errorMessage") as String
+String msg = "Elevated action failed: " + err
+execution.setVariable("resultMessage", msg)
+loggerApi.info(msg)
+
+// Resolve the asset defensively: if 'item' is what failed upstream, this
+// handler must not fail the same way and swallow the diagnosis.
+def target = null
+try { target = item } catch (Exception ignored) { }
+if (target == null) {
+    try { target = execution.getVariable("item") } catch (Exception ignored) { }
+}
+
+if (target == null) {
+    loggerApi.info("Could not post failure comment: 'item' is not bound here.")
+} else {
+    try {
+        commentApi.addComment(
+            AddCommentRequest.builder()
+                .baseResourceType(ResourceType.Asset)
+                .baseResourceId(target.id)
+                .content("<b>Elevated action FAILED</b><br/>" + err
+                         + "<br/>Requested by: " + execution.getVariable("initiator"))
+                .build())
+    } catch (Exception e) {
+        loggerApi.info("Could not post failure comment: " + e.getMessage())
+    }
+}
+]]></script>
+    </scriptTask>
+    <endEvent id="endnoneevent_failed" name="Failed">
+      <extensionElements>
+        <design:stencilid><![CDATA[EndNoneEvent]]></design:stencilid>
+      </extensionElements>
+    </endEvent>
+
+    <sequenceFlow id="sequenceFlow1" sourceRef="startnoneevent1" targetRef="usertask_provideDetails">
+      <extensionElements>
+        <design:stencilid><![CDATA[SequenceFlow]]></design:stencilid>
+      </extensionElements>
+    </sequenceFlow>
+    <sequenceFlow id="sequenceFlow2" sourceRef="usertask_provideDetails" targetRef="gateway_action">
+      <extensionElements>
+        <design:stencilid><![CDATA[SequenceFlow]]></design:stencilid>
+      </extensionElements>
+    </sequenceFlow>
+    <sequenceFlow id="sequenceFlow3" sourceRef="gateway_action" targetRef="scripttask_setAttribute" name="Set attribute value">
+      <extensionElements>
+        <design:stencilid><![CDATA[SequenceFlow]]></design:stencilid>
+      </extensionElements>
+      <conditionExpression xsi:type="tFormalExpression"><![CDATA[${action == 'SetAttribute'}]]></conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="sequenceFlow4" sourceRef="gateway_action" targetRef="scripttask_addAttribute" name="Add another value">
+      <extensionElements>
+        <design:stencilid><![CDATA[SequenceFlow]]></design:stencilid>
+      </extensionElements>
+      <conditionExpression xsi:type="tFormalExpression"><![CDATA[${action == 'AddAttribute'}]]></conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="sequenceFlow5" sourceRef="gateway_action" targetRef="scripttask_clearAttribute" name="Clear attribute value">
+      <extensionElements>
+        <design:stencilid><![CDATA[SequenceFlow]]></design:stencilid>
+      </extensionElements>
+      <conditionExpression xsi:type="tFormalExpression"><![CDATA[${action == 'ClearAttribute'}]]></conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="sequenceFlow6" sourceRef="gateway_action" targetRef="scripttask_assignRole" name="Assign role">
+      <extensionElements>
+        <design:stencilid><![CDATA[SequenceFlow]]></design:stencilid>
+      </extensionElements>
+      <conditionExpression xsi:type="tFormalExpression"><![CDATA[${action == 'AssignRole'}]]></conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="sequenceFlow7" sourceRef="gateway_action" targetRef="scripttask_removeRole" name="Remove role">
+      <extensionElements>
+        <design:stencilid><![CDATA[SequenceFlow]]></design:stencilid>
+      </extensionElements>
+      <conditionExpression xsi:type="tFormalExpression"><![CDATA[${action == 'RemoveRole'}]]></conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="sequenceFlow8" sourceRef="scripttask_setAttribute" targetRef="gateway_result">
+      <extensionElements>
+        <design:stencilid><![CDATA[SequenceFlow]]></design:stencilid>
+      </extensionElements>
+    </sequenceFlow>
+    <sequenceFlow id="sequenceFlow9" sourceRef="scripttask_addAttribute" targetRef="gateway_result">
+      <extensionElements>
+        <design:stencilid><![CDATA[SequenceFlow]]></design:stencilid>
+      </extensionElements>
+    </sequenceFlow>
+    <sequenceFlow id="sequenceFlow10" sourceRef="scripttask_clearAttribute" targetRef="gateway_result">
+      <extensionElements>
+        <design:stencilid><![CDATA[SequenceFlow]]></design:stencilid>
+      </extensionElements>
+    </sequenceFlow>
+    <sequenceFlow id="sequenceFlow11" sourceRef="scripttask_assignRole" targetRef="gateway_result">
+      <extensionElements>
+        <design:stencilid><![CDATA[SequenceFlow]]></design:stencilid>
+      </extensionElements>
+    </sequenceFlow>
+    <sequenceFlow id="sequenceFlow12" sourceRef="scripttask_removeRole" targetRef="gateway_result">
+      <extensionElements>
+        <design:stencilid><![CDATA[SequenceFlow]]></design:stencilid>
+      </extensionElements>
+    </sequenceFlow>
+    <sequenceFlow id="sequenceFlow13" sourceRef="gateway_result" targetRef="scripttask_notifySuccess" name="Succeeded">
+      <extensionElements>
+        <design:stencilid><![CDATA[SequenceFlow]]></design:stencilid>
+      </extensionElements>
+      <conditionExpression xsi:type="tFormalExpression"><![CDATA[${actionSucceeded == true}]]></conditionExpression>
+    </sequenceFlow>
+    <sequenceFlow id="sequenceFlow14" sourceRef="scripttask_notifySuccess" targetRef="endnoneevent_completed">
+      <extensionElements>
+        <design:stencilid><![CDATA[SequenceFlow]]></design:stencilid>
+      </extensionElements>
+    </sequenceFlow>
+    <sequenceFlow id="sequenceFlow15" sourceRef="gateway_result" targetRef="scripttask_handleError" name="Failed">
+      <extensionElements>
+        <design:stencilid><![CDATA[SequenceFlow]]></design:stencilid>
+      </extensionElements>
+    </sequenceFlow>
+    <sequenceFlow id="sequenceFlow16" sourceRef="scripttask_handleError" targetRef="endnoneevent_failed">
+      <extensionElements>
+        <design:stencilid><![CDATA[SequenceFlow]]></design:stencilid>
+      </extensionElements>
+    </sequenceFlow>
+  </process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_contributorElevatedActions">
+    <bpmndi:BPMNPlane bpmnElement="contributorElevatedActions" id="BPMNPlane_contributorElevatedActions">
+      <bpmndi:BPMNShape bpmnElement="startnoneevent1" id="BPMNShape_startnoneevent1">
+        <omgdc:Bounds height="30.0" width="30.0" x="0.0" y="281.0"></omgdc:Bounds>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="usertask_provideDetails" id="BPMNShape_usertask_provideDetails">
+        <omgdc:Bounds height="80.0" width="100.0" x="90.0" y="256.0"></omgdc:Bounds>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="gateway_action" id="BPMNShape_gateway_action">
+        <omgdc:Bounds height="40.0" width="40.0" x="240.0" y="271.0"></omgdc:Bounds>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="scripttask_setAttribute" id="BPMNShape_scripttask_setAttribute">
+        <omgdc:Bounds height="80.0" width="110.0" x="340.0" y="0.0"></omgdc:Bounds>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="scripttask_addAttribute" id="BPMNShape_scripttask_addAttribute">
+        <omgdc:Bounds height="80.0" width="110.0" x="340.0" y="110.0"></omgdc:Bounds>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="scripttask_clearAttribute" id="BPMNShape_scripttask_clearAttribute">
+        <omgdc:Bounds height="80.0" width="110.0" x="340.0" y="220.0"></omgdc:Bounds>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="scripttask_assignRole" id="BPMNShape_scripttask_assignRole">
+        <omgdc:Bounds height="80.0" width="110.0" x="340.0" y="330.0"></omgdc:Bounds>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="scripttask_removeRole" id="BPMNShape_scripttask_removeRole">
+        <omgdc:Bounds height="80.0" width="110.0" x="340.0" y="440.0"></omgdc:Bounds>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="gateway_result" id="BPMNShape_gateway_result">
+        <omgdc:Bounds height="40.0" width="40.0" x="520.0" y="271.0"></omgdc:Bounds>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="scripttask_notifySuccess" id="BPMNShape_scripttask_notifySuccess">
+        <omgdc:Bounds height="80.0" width="110.0" x="610.0" y="170.0"></omgdc:Bounds>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="endnoneevent_completed" id="BPMNShape_endnoneevent_completed">
+        <omgdc:Bounds height="28.0" width="28.0" x="770.0" y="196.0"></omgdc:Bounds>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="scripttask_handleError" id="BPMNShape_scripttask_handleError">
+        <omgdc:Bounds height="80.0" width="110.0" x="610.0" y="370.0"></omgdc:Bounds>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="endnoneevent_failed" id="BPMNShape_endnoneevent_failed">
+        <omgdc:Bounds height="28.0" width="28.0" x="770.0" y="396.0"></omgdc:Bounds>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow1" id="BPMNEdge_sequenceFlow1">
+        <omgdi:waypoint x="30.0" y="296.0"></omgdi:waypoint>
+        <omgdi:waypoint x="90.0" y="296.0"></omgdi:waypoint>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow2" id="BPMNEdge_sequenceFlow2">
+        <omgdi:waypoint x="190.0" y="296.0"></omgdi:waypoint>
+        <omgdi:waypoint x="240.0" y="291.0"></omgdi:waypoint>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow3" id="BPMNEdge_sequenceFlow3">
+        <omgdi:waypoint x="280.0" y="291.0"></omgdi:waypoint>
+        <omgdi:waypoint x="340.0" y="40.0"></omgdi:waypoint>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow4" id="BPMNEdge_sequenceFlow4">
+        <omgdi:waypoint x="280.0" y="291.0"></omgdi:waypoint>
+        <omgdi:waypoint x="340.0" y="150.0"></omgdi:waypoint>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow5" id="BPMNEdge_sequenceFlow5">
+        <omgdi:waypoint x="280.0" y="291.0"></omgdi:waypoint>
+        <omgdi:waypoint x="340.0" y="260.0"></omgdi:waypoint>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow6" id="BPMNEdge_sequenceFlow6">
+        <omgdi:waypoint x="280.0" y="291.0"></omgdi:waypoint>
+        <omgdi:waypoint x="340.0" y="370.0"></omgdi:waypoint>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow7" id="BPMNEdge_sequenceFlow7">
+        <omgdi:waypoint x="280.0" y="291.0"></omgdi:waypoint>
+        <omgdi:waypoint x="340.0" y="480.0"></omgdi:waypoint>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow8" id="BPMNEdge_sequenceFlow8">
+        <omgdi:waypoint x="450.0" y="40.0"></omgdi:waypoint>
+        <omgdi:waypoint x="520.0" y="291.0"></omgdi:waypoint>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow9" id="BPMNEdge_sequenceFlow9">
+        <omgdi:waypoint x="450.0" y="150.0"></omgdi:waypoint>
+        <omgdi:waypoint x="520.0" y="291.0"></omgdi:waypoint>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow10" id="BPMNEdge_sequenceFlow10">
+        <omgdi:waypoint x="450.0" y="260.0"></omgdi:waypoint>
+        <omgdi:waypoint x="520.0" y="291.0"></omgdi:waypoint>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow11" id="BPMNEdge_sequenceFlow11">
+        <omgdi:waypoint x="450.0" y="370.0"></omgdi:waypoint>
+        <omgdi:waypoint x="520.0" y="291.0"></omgdi:waypoint>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow12" id="BPMNEdge_sequenceFlow12">
+        <omgdi:waypoint x="450.0" y="480.0"></omgdi:waypoint>
+        <omgdi:waypoint x="520.0" y="291.0"></omgdi:waypoint>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow13" id="BPMNEdge_sequenceFlow13">
+        <omgdi:waypoint x="560.0" y="291.0"></omgdi:waypoint>
+        <omgdi:waypoint x="610.0" y="210.0"></omgdi:waypoint>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow14" id="BPMNEdge_sequenceFlow14">
+        <omgdi:waypoint x="720.0" y="210.0"></omgdi:waypoint>
+        <omgdi:waypoint x="770.0" y="210.0"></omgdi:waypoint>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow15" id="BPMNEdge_sequenceFlow15">
+        <omgdi:waypoint x="560.0" y="291.0"></omgdi:waypoint>
+        <omgdi:waypoint x="610.0" y="410.0"></omgdi:waypoint>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow16" id="BPMNEdge_sequenceFlow16">
+        <omgdi:waypoint x="720.0" y="410.0"></omgdi:waypoint>
+        <omgdi:waypoint x="770.0" y="410.0"></omgdi:waypoint>
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</definitions>
