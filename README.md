@@ -60,9 +60,8 @@ membership and inherited responsibilities correctly.
 ## Quick start
 
 1. **Import** `contributor-elevated-actions.bpmn` via Settings → Workflows → Definitions.
-2. **Scope it**: set **Applies to** = `Asset`, and in the assignment set
-   `Asset` — the root type, which covers every asset type. Picking a
-   specific type here limits the workflow to that type only.
+2. **Scope it**: set **Applies to** = `Asset` the root type, which covers every asset type. Creating a
+   rule, specific to an asset type here limits the workflow to that type only.
 3. **Restrict it**: under **Roles → Start Workflow**, add the resource role whose
    holders should get this capability. Leave *"Any user can start the workflow"*
    unchecked.
